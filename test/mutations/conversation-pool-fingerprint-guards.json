@@ -1,0 +1,60 @@
+{
+  "_baseline_provenance": "MEASURED 2026-09-13 on the author's Windows box, Node v24.19.0, worktree .claude/worktrees/guards-core at master 4cbd029. Declared value 27. Exact command: `node --import ./scripts/mutation-network-deny.mjs --import ./test/setup-env.mjs --test --test-reporter=tap --test-force-exit test/conversation-pool.test.js` -> `# tests 27 / # pass 27 / # fail 0 / # skipped 0 / # todo 0`, IDENTICAL over six consecutive runs. Re-measured with the harness's OWN counting semantics: scripts/mutation-harness-utils.mjs is both the harness helper and its structured reporter and throws at import on Windows ('mutation harness requires git at a trusted absolute path'), so tmp/harness-reporter.mjs is a verbatim copy of its reporter half used as `--test-reporter=./tmp/harness-reporter.mjs`; the aggregate summary was {tests 27, failed 0, passed 27, cancelled 0, skipped 0, todo 0, topLevel 6, suites 6}, IDENTICAL over four consecutive runs and equal to the TAP counts. This spec names ONE test file, so the harness's combined invocation and a per-file invocation are the same argv by construction and there is no per-file-vs-combined gap to report. DRIFT DISCLOSURE: per-file counts in this repo are known to drift between identical CI runs (2026-09-13 measurement: test/cascade-native-bridge.test.js reported 61 in one CI run and 68 in another; twelve identical runs of another file produced eleven distinct counts). No drift was reproducible for THIS file locally (10/10 runs identical at 27), and this suite is synchronous pure-function assertion over src/conversation-pool.js with no timers of its own, no post-import env reads and no child processes, which is why it was chosen ahead of the other unpinned modules. If guard 2 still rejects 27 on the Linux runner, that is the correct loud outcome: re-measure there with `node scripts/spec-baseline-audit.mjs conversation-pool-fingerprint-guards` and change the number, do NOT narrow the mutations to make it start.",
+  "_scope_note": "src/conversation-pool.js had zero mutation specs before this file (audit 2026-09-13: 35 of 77 non-vendor src files pinned, and this 33 KB module was one of the four largest unpinned ones). Every mutation below targets the reuse FINGERPRINT contract, because a silent change there does not throw: the pool just misses every turn (or worse, hits a cascade that belongs to different content), and every remaining test in the tree stays green.",
+  "tests": [
+    "test/conversation-pool.test.js"
+  ],
+  "expectBaselinePass": 27,
+  "mutations": [
+    {
+      "name": "priorTurnsForBefore no longer refuses a single-turn conversation — with no prior turn to digest, every first turn for the same caller/model produces the SAME fingerprint (the empty trajectory), so a brand-new conversation can check out an unrelated cascade instead of starting fresh",
+      "file": "src/conversation-pool.js",
+      "anchor": "  if (newestStable === 0) return null;",
+      "replacement": "  if (false) return null;"
+    },
+    {
+      "name": "priorTurnsForBefore stops dropping the newest user/tool turn (slice end +1) — the 'before' fingerprint now describes a state that has not happened yet, so after(turn1) no longer equals before(turn2) and the cascade we just stored can never be looked up again: reuse degrades to a fresh cascade every turn, silently",
+      "file": "src/conversation-pool.js",
+      "anchor": "  return messages.slice(0, newestStable);",
+      "replacement": "  return messages.slice(0, newestStable + 1);"
+    },
+    {
+      "name": "stripMetaTags stops applying META_TAG_RE — the client-injected tags that change every turn (cwd snapshot, todo state, hook output) go back into the hash, which is exactly issue #24: the fingerprint drifts on every request and Cascade reuse silently falls back to fresh for the whole session",
+      "file": "src/conversation-pool.js",
+      "anchor": "  const stripped = s.replace(META_TAG_RE, '').replace(/[ \\t]+\\n/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();",
+      "replacement": "  const stripped = s.replace(/[ \\t]+\\n/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();"
+    },
+    {
+      "name": "the assistant text projection stops collapsing internal whitespace — a client that re-renders the same prior answer with different spacing (markdown reflow, stream reassembly) hashes differently, so the next turn misses the cascade we just stored and the model re-reads the whole history",
+      "file": "src/conversation-pool.js",
+      "anchor": "      .map(b => (b.text || '').replace(/\\s+/g, ' ').trim())",
+      "replacement": "      .map(b => (b.text || '').trim())"
+    },
+    {
+      "name": "systemDigest returns '' unconditionally — the pre-audit default, where two different system prompts share one fingerprint, so a caller is handed a cascade resumed under someone else's system context instead of missing",
+      "file": "src/conversation-pool.js",
+      "anchor": "  if (process.env.CASCADE_REUSE_HASH_SYSTEM === '0') return '';",
+      "replacement": "  return '';"
+    },
+    {
+      "name": "an image block with no stable id becomes hashable again — distinct unhashable media collide into one fingerprint instead of disabling reuse for that request, so the wrong image can be resumed against",
+      "file": "src/conversation-pool.js",
+      "anchor": "    return { type: 'image', unhashable: true };",
+      "replacement": "    return { type: 'image', url: 'unknown' };"
+    },
+    {
+      "name": "checkin drops the inherited ttlHintMs when the caller passes no hint (audit MED-2) — an entry that was written under an Anthropic 1h prompt-cache marker loses the hint on the next round-trip, so the 1h cache window silently collapses back to the 30-minute pool default",
+      "file": "src/conversation-pool.js",
+      "anchor": "  if (ttlHintMs === undefined) {\n    resolvedHint = entry.ttlHintMs;",
+      "replacement": "  if (ttlHintMs === undefined) {\n    resolvedHint = undefined;"
+    },
+    {
+      "name": "KNOWN SURVIVOR — checkout drops the entry-vs-request callerKey comparison, so a pooled entry may be handed to a request whose callerKey differs. Not covered by design, and not reachable through the public API today: callerKey is itself hashed into the key payload (buildKeyPayload sets `caller`), so two different callers never produce the same fingerprint and the branch cannot fire. The suite's caller-isolation assertions compare two DIFFERENT fingerprints and therefore pass with or without this line. It is defence in depth for a future key layout that drops caller from the payload — if that refactor ever happens, this mutation starts being caught and this spec will say so.",
+      "file": "src/conversation-pool.js",
+      "anchor": "  if (entry.callerKey && callerKey && entry.callerKey !== callerKey) {",
+      "replacement": "  if (false) {",
+      "expectCaught": false
+    }
+  ],
+  "_not_covered": "Three invariants in this module are NOT pinned, because no existing assertion drives them. All three were MEASURED with a throwaway probe spec (tmp/uncovered-probe.json, gitignored, same reporter and argv as this spec): each of the three mutations below was applied and the suite stayed green, so these are recorded findings rather than guesses. (1) Deleting `.sort()` from `Object.keys(v).sort()` in stableStringify survives — the test named 'object key order in mixed content is stable' passes anyway, because canonicalContentBlock builds its image record itself ({type, url}) with a fixed key order, so caller key order never reaches stableStringify through that path; the routes where it does are the unknown-typed-block fallback (`json: stableStringify(part)`) and the parsed tool-call arguments digest, and neither has a test that feeds two orderings of the same object. (2) invalidateFor's second-pass sibling cleanup (audit H-2) is unpinned: it only matters when one cascadeId is indexed under several fingerprint slots (checkin with an array) or an alias slot carries a different apiKey, and test/conversation-pool.test.js never builds an alias slot, so `if (!drop && e.cascadeId && targetCascadeIds.has(e.cascadeId)) drop = true;` can be disabled with the suite staying green. (3) The REUSE_BY_CALLER caller-fallback index is off by default (CASCADE_REUSE_BY_CALLER must be '1' at module load) and no test sets it, so _callerFallbackCheckout is dead code under the test environment; making it inert (`const fp = null;`) survives."
+}

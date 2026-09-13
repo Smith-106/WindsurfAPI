@@ -1,0 +1,59 @@
+{
+  "_baseline_provenance": "MEASURED 2026-09-13 on the author's Windows box, Node v24.19.0, worktree .claude/worktrees/guards-core at master 4cbd029. Declared value 68. Exact command: `node --import ./scripts/mutation-network-deny.mjs --import ./test/setup-env.mjs --test --test-reporter=tap --test-force-exit test/cascade-native-bridge.test.js` -> `# tests 68 / # pass 68 / # fail 0 / # skipped 0 / # todo 0`, IDENTICAL over six consecutive runs. Re-measured with the harness's OWN counting semantics: scripts/mutation-harness-utils.mjs is both the harness helper and its structured reporter and throws at import on Windows ('mutation harness requires git at a trusted absolute path'), so tmp/harness-reporter.mjs is a verbatim copy of its reporter half used as `--test-reporter=./tmp/harness-reporter.mjs`; the aggregate summary was {tests 68, failed 0, passed 68, cancelled 0, skipped 0, todo 0, topLevel 13, suites 13}, IDENTICAL over four consecutive runs and equal to the TAP counts. This spec names ONE test file, so the harness's combined invocation and a per-file invocation are the same argv by construction and there is no per-file-vs-combined gap to report. DRIFT DISCLOSURE — READ BEFORE TRUSTING 68: during the same session the harness's own CI sweep measured **61** for this same file, green with 0 failures and 0 skips, and 61 is NOT reproducible here (10/10 local runs at 68 under both reporters). So 68 is the number this box measures and can defend, but it is NOT defended as CI-reproducible: per-file counts in this repo drift between identical CI runs by a mechanism that is still unidentified (HANDOFF P1). If guard 2 refuses this baseline on the runner, the spec is correctly declining to produce verdicts — re-measure on the runner with `node scripts/spec-baseline-audit.mjs cascade-native-bridge-gates` and update the number in its own commit; do NOT narrow the mutations or lower the number to make it start.",
+  "_scope_note": "src/cascade-native-bridge.js (64 KB) had zero mutation specs before this file. The four gates below are the ones that decide whether a caller's tools run in the client's own process or inside Windsurf's REMOTE sandbox; the source records two production regressions (v2.0.70 GPT auto-on, v2.0.75 #124 'every Claude tool call stuck for 6+ minutes') that shipped from exactly this file, and the existing test file already pins the corrected behaviour, so these mutations are re-introductions of real defects rather than cosmetic edits.",
+  "_not_covered": "Deliberately out of this spec's scope, and MEASURED as such with a throwaway probe (tmp/bridge-probe-a.json / -b.json, gitignored, same argv): nativeBridgeGrayGateStatus's API-key and caller restrictions are NOT pinned by test/cascade-native-bridge.test.js — disabling either `if (csvListEnv('WINDSURFAPI_NATIVE_TOOL_BRIDGE_API_KEYS').length && ...)` or `if (!envGateAllows('WINDSURFAPI_NATIVE_TOOL_BRIDGE_CALLERS', callerKeys))` leaves this file's 68 tests green — but both are CAUGHT (fail=1 each) when the same mutations run against test/native-tool-routing.test.js, which owns gray-gate coverage with its 28 tests. They are omitted here rather than listed as survivors because the repo does catch them; including them would mean naming two test files in `tests` and reintroducing the cross-file aggregation the baseline caveat warns about.",
+  "tests": [
+    "test/cascade-native-bridge.test.js"
+  ],
+  "expectBaselinePass": 68,
+  "mutations": [
+    {
+      "name": "partitionTools drops the default allowlist gate — Read/Glob/Edit, whose translators exist for protocol-matrix work but whose intent is LOCAL execution, become natively mapped by default: this is the #124 shape, where the cascade planner runs the tool in the remote workspace sandbox and Claude Code hangs until the warm stall fires",
+      "file": "src/cascade-native-bridge.js",
+      "anchor": "      if (TOOL_MAP[t.function.name] && isNativeBridgeToolAllowed(t.function.name)) mapped.push(t);",
+      "replacement": "      if (TOOL_MAP[t.function.name]) mapped.push(t);"
+    },
+    {
+      "name": "the OFF kill-switch stops being consulted — WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF=1 is documented as the highest-priority override, so removing the check turns an operator's emergency stop into a no-op while an explicit WINDSURFAPI_NATIVE_TOOL_BRIDGE=1 keeps routing tools to the remote sandbox",
+      "file": "src/cascade-native-bridge.js",
+      "anchor": "  if (process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF === '1') {",
+      "replacement": "  if (false) {"
+    },
+    {
+      "name": "the all_mapped precondition is dropped — all_mapped mode now fires with unmapped tools still declared, so the planner gets a native allowlist that cannot serve them while the emulation toolPreamble no longer carries their schemas: the exact 'tool exists but the model cannot call it' failure partition mode was written to avoid",
+      "file": "src/cascade-native-bridge.js",
+      "anchor": "  if (allMappedOnly && partition.unmapped.length) {",
+      "replacement": "  if (false) {"
+    },
+    {
+      "name": "NATIVE_XML_BODY_MAX is raised past any plausible block — an unclosed <function_calls> block is no longer dropped, so the stream parser holds upstream output in this.buffer without bound instead of discarding it, turning a malformed model response into unbounded RSS growth on a long stream",
+      "file": "src/cascade-native-bridge.js",
+      "anchor": "const NATIVE_XML_BODY_MAX = 65_536;",
+      "replacement": "const NATIVE_XML_BODY_MAX = 65_536 * 1024;"
+    },
+    {
+      "name": "partialFunctionCallsPrefixLength never holds a partial opening tag — a delta that ends mid-`<function_calls` is flushed straight to the client, so the raw provider-native XML marker leaks into user-visible output and the block can never be reassembled into a tool_call when the rest arrives",
+      "file": "src/cascade-native-bridge.js",
+      "anchor": "    if (lower.endsWith(lit.slice(0, n))) return n;",
+      "replacement": "    if (false) return n;"
+    },
+    {
+      "name": "the non-stream parser keeps a dangling <function_calls> block instead of cutting it — an incomplete native block is echoed back as literal XML in the assistant text (the same leak the stream path bounds), and the partial marker is visible to the caller's UI",
+      "file": "src/cascade-native-bridge.js",
+      "anchor": "  keepOutsideBlocks.push(danglingOpen === -1 ? trailing : trailing.slice(0, danglingOpen));",
+      "replacement": "  keepOutsideBlocks.push(trailing);"
+    },
+    {
+      "name": "an invoke for a tool the caller never declared is still converted — the callerLookup miss is treated as 'use identity args', so the proxy invents a tool_call for a tool absent from the request's tools[]; a strict client rejects the whole response, and a lenient one executes an unadvertised tool",
+      "file": "src/cascade-native-bridge.js",
+      "anchor": "      if (!callerName) continue;",
+      "replacement": "      if (false) continue;"
+    },
+    {
+      "name": "the assistant→tool history overlay writes an empty observation — the tool result never reaches the additional_steps body, so the planner is told 'this step ran' with no output and re-runs or fabricates the result instead of reasoning from it",
+      "file": "src/cascade-native-bridge.js",
+      "anchor": "        if (entry.kind === 'view_file') cascadeArgs.content = observation;",
+      "replacement": "        if (entry.kind === 'view_file') cascadeArgs.content = '';"
+    }
+  ]
+}
