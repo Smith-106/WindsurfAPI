@@ -1986,6 +1986,11 @@ export function injectPreambleIntoSystemPrompt(messages, preamble) {
   return [{ role: 'system', content: preamble.trim() }, ...messages];
 }
 
+// The tier builders raise this to say "I already proved I am over the caller's cap;
+// drop me instead of measuring me". Matched by NAME rather than by an imported class so
+// the ladder keeps working against a builder from either side of the change.
+const isTierOverBudgetSignal = (err) => err?.name === 'SchemaCompactTierDropped';
+
 export function applyToolPreambleBudget(tools, toolChoice, callerEnv = '', opts = {}) {
   const modelKey = opts.modelKey || null;
   const provider = opts.provider || null;
@@ -1994,9 +1999,20 @@ export function applyToolPreambleBudget(tools, toolChoice, callerEnv = '', opts 
   const softBytes = opts.softBytes ?? parseInt(process.env.TOOL_PREAMBLE_SOFT_BYTES || '24000', 10);
   const hardBytes = opts.hardBytes ?? parseInt(process.env.TOOL_PREAMBLE_HARD_BYTES || '48000', 10);
   const tierOpts = nativeStructured ? { nativeStructured: true } : {};
+  // The byte cap the schema-compact builder may stop at, derived HERE so it cannot
+  // drift from the caps this function actually enforces. A tier is rejected once its
+  // length exceeds EITHER cap, so past min(softBytes, hardBytes) its rejection is
+  // already certain and every further node the `$ref` inliner walks is work on a
+  // string that gets thrown away — for a `$ref` diamond, megabytes of it, on the
+  // one thread every other tenant shares. With the shipped defaults
+  // (soft=24000 < hard=48000) this bound is the soft cap. It must be the MINIMUM of
+  // the two, not the maximum: the builder prunes the string it returns, so the bound
+  // has to be the first cap at which rejection is already certain, and a tier
+  // between the caps is still rejected by the check below.
+  const abortAtBytes = Math.min(softBytes, hardBytes);
   const tiers = [
     { tier: 'full', build: buildToolPreambleForProto },
-    { tier: 'schema-compact', build: buildSchemaCompactToolPreambleForProto },
+    { tier: 'schema-compact', build: buildSchemaCompactToolPreambleForProto, opts: { abortAtBytes } },
     { tier: 'skinny', build: buildSkinnyToolPreambleForProto },
     { tier: 'names-only', build: buildCompactToolPreambleForProto },
   ];
@@ -2008,10 +2024,22 @@ export function applyToolPreambleBudget(tools, toolChoice, callerEnv = '', opts 
 
   // Walk the tiers from largest to smallest; pick the first one that fits
   // under the soft cap. If none fit (extreme tool counts), fall through to
-  // names-only and let the hard-cap check decide whether to reject.
+  // names-only and let the hard-cap check decide whether to reject. A tier that
+  // reports it was PROVABLY over the cap is dropped unseen, which is the same
+  // decision this loop would have reached by measuring it.
   let chosen = { tier: 'full', preamble: full, bytes: fullBytes };
   for (const t of tiers) {
-    const text = t.tier === 'full' ? full : t.build(tools || [], toolChoice, callerEnv, modelKey, provider, route, tierOpts);
+    if (t.tier === 'full') {
+      if (fullBytes <= softBytes) break;
+      continue;
+    }
+    let text;
+    try {
+      text = t.build(tools || [], toolChoice, callerEnv, modelKey, provider, route, { ...tierOpts, ...t.opts });
+    } catch (err) {
+      if (isTierOverBudgetSignal(err)) continue;
+      throw err;
+    }
     const bytes = Buffer.byteLength(text, 'utf8');
     chosen = { tier: t.tier, preamble: text, bytes };
     if (bytes <= softBytes) break;

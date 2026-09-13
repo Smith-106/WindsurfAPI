@@ -32,7 +32,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { applyToolPreambleBudget, injectPreambleIntoSystemPrompt } from '../src/handlers/chat.js';
-import { buildSchemaCompactToolPreambleForProto } from '../src/handlers/tool-emulation.js';
+import {
+  buildSchemaCompactToolPreambleForProto, buildToolPreambleForProto,
+  buildSkinnyToolPreambleForProto, buildCompactToolPreambleForProto,
+} from '../src/handlers/tool-emulation.js';
 import { log } from '../src/config.js';
 
 // ─── shape battery ─────────────────────────────────────────────────────────
@@ -406,7 +409,231 @@ test('tier ladder: a discarded tier is never the one that ships', () => {
   assert.equal(injectPreambleIntoSystemPrompt([], r.preamble).length, 1);
 });
 
+// ─── the bounded walk must not be observable at all ────────────────────────
+// applyToolPreambleBudget asks the schema-compact builder to stop once the inliner
+// has PROVEN more bytes than that tier could ever be accepted with. Everything above
+// pins the shipped bytes of the ordinary path; this section pins the property the
+// speed-up rests on: dropping the walk early changes NOTHING that can be observed,
+// and the truncation itself can never reach `preamble`.
+//
+// Both sides of every comparison below use the same three arguments the goldens use
+// (`callerEnv = 'cwd: D:/w'`, modelKey `claude-sonnet-4.6`, route `chat`): the
+// preamble tiers are not length-neutral in any of them (calling the ladder with an
+// EMPTY callerEnv moves tools2000x1 by 470 bytes), so a comparison that varied one
+// would measure the argument, not the change.
+const ENV_ARG = 'cwd: D:/w';
+const MODEL_ARG = 'claude-sonnet-4.6';
+
+/** Every tier built with NO byte bound — i.e. what the ladder did before the bound. */
+function ladderUnbounded(tools, opts = {}) {
+  const softBytes = opts.softBytes ?? parseInt(process.env.TOOL_PREAMBLE_SOFT_BYTES || '24000', 10);
+  const hardBytes = opts.hardBytes ?? parseInt(process.env.TOOL_PREAMBLE_HARD_BYTES || '48000', 10);
+  const tierOpts = opts.nativeStructured ? { nativeStructured: true } : {};
+  const args = [tools, 'auto', ENV_ARG, opts.modelKey || null, opts.provider || null, opts.route || null, tierOpts];
+  const tiers = [
+    ['full', () => buildToolPreambleForProto(...args)],
+    ['schema-compact', () => buildSchemaCompactToolPreambleForProto(...args)],
+    ['skinny', () => buildSkinnyToolPreambleForProto(...args)],
+    ['names-only', () => buildCompactToolPreambleForProto(...args)],
+  ];
+  const full = tiers[0][1]();
+  if (!full) return { ok: true, preamble: '', fullBytes: 0, finalBytes: 0, compacted: false, tier: 'empty' };
+  let chosen = { tier: 'full', preamble: full, bytes: Buffer.byteLength(full, 'utf8') };
+  for (const [tier, build] of tiers) {
+    const text = tier === 'full' ? full : build();
+    const bytes = Buffer.byteLength(text, 'utf8');
+    chosen = { tier, preamble: text, bytes };
+    if (bytes <= softBytes) break;
+  }
+  const compacted = chosen.tier !== 'full';
+  return { ok: chosen.bytes <= hardBytes, preamble: chosen.preamble, fullBytes: Buffer.byteLength(full, 'utf8'), finalBytes: chosen.bytes, compacted, tier: chosen.tier };
+}
+
+/** The shipped result hashed: everything the request path can observe. */
+function fingerprint(r) {
+  return JSON.stringify({
+    tier: r.tier, ok: r.ok, compacted: r.compacted, fullBytes: r.fullBytes, finalBytes: r.finalBytes,
+    sha256: createHash('sha256').update(r.preamble).digest('hex'),
+  });
+}
+
+const ladderOpts = (extra = {}) => ({ modelKey: MODEL_ARG, route: 'chat', ...extra });
+
+test('bounded walk: the result is byte-identical to an unbounded ladder, on every golden setting', () => {
+  withDefaultCaps(() => {
+    for (const g of GOLDENS) {
+      const tools = SHAPES[g.shape]();
+      const opts = ladderOpts();
+      if (g.soft !== undefined) opts.softBytes = g.soft;
+      if (g.hard !== undefined) opts.hardBytes = g.hard;
+      if (g.nativeStructured) opts.nativeStructured = true;
+      const bounded = applyToolPreambleBudget(tools, 'auto', ENV_ARG, opts);
+      const unbounded = ladderUnbounded(tools, opts);
+      const where = `${g.shape} soft=${g.soft ?? 'default'} hard=${g.hard ?? 'default'} native=${g.nativeStructured}`;
+      assert.equal(fingerprint(bounded), fingerprint(unbounded),
+        `${where}: bounding the schema-compact walk changed an observable`);
+      // And the dropped tier can never be what shipped.
+      assert.equal(Buffer.byteLength(bounded.preamble, 'utf8'), bounded.finalBytes, `${where}: preamble length`);
+    }
+  });
+});
+
+test('bounded walk: an aborted tier is dropped, never shipped as its own truncated prefix', () => {
+  // The 14-level diamond builds to ~1 MB canonical and is rejected by both caps. The
+  // walk now stops after ~2.7 KB, and that prefix fits the soft cap — so a ladder
+  // that measured it would ACCEPT and ship a preamble whose schemas are placeholders.
+  // This is the regression the drop signal exists for: assert the tier, not the prefix.
+  const tools = SHAPES.nested_diamond14();
+  const r = applyToolPreambleBudget(tools, 'auto', ENV_ARG, ladderOpts());
+  assert.equal(r.tier, 'skinny', 'the diamond must still fall through to skinny');
+  assert.equal(r.finalBytes, 11714, 'skinny tier size for this shape is pinned by the goldens');
+  assert.equal(r.preamble.includes('Params: {"type":"object"}'), false,
+    'the truncated schema-compact prefix leaked into the shipped preamble');
+  assert.equal(r.preamble.includes('field_path'), false, 'sanity: the diamond has no such parameter');
+  assert.ok(r.preamble.includes('Sig') || r.preamble.includes('root'), 'the shipped skinny tier must be the real one');
+  assert.equal(fingerprint(r), fingerprint(ladderUnbounded(tools, ladderOpts())));
+});
+
+test('bounded walk: the cap it stops at is the caller\'s own cap, not a hardcoded default', () => {
+  // The abort bound is min(soft, hard), so it must NOT fire whenever a caller's caps
+  // leave the schema-compact tier acceptable: tools25's canonical compact tier is
+  // 22,829 B and its full tier is 129,654 B, so caps of 50 KB/60 KB reject `full` and
+  // must let schema-compact be built in full and SHIP. A bound hardcoded to the 24,000
+  // default would still build this one, but a bound derived from the WRONG cap (the
+  // 24,000 soft default instead of the caller's) is what the rest of this test pins.
+  const tools = SHAPES.tools25();
+  const opts = ladderOpts({ softBytes: 50_000, hardBytes: 60_000 });
+  const r = applyToolPreambleBudget(tools, 'auto', ENV_ARG, opts);
+  assert.equal(r.tier, 'schema-compact', 'a caller whose caps accept the tier must not have it aborted');
+  assert.equal(r.finalBytes, 22829, 'the full 22,829 B compact tier must be built, not a prefix');
+  assert.equal(r.ok, true);
+  assert.equal(fingerprint(r), fingerprint(ladderUnbounded(tools, opts)));
+  // Same shape, caps that are high enough to accept everything: `full` wins, and the
+  // bound (1 MB) is far above it, so nothing is pruned.
+  const huge = ladderOpts({ softBytes: 1_000_000, hardBytes: 2_000_000 });
+  assert.equal(fingerprint(applyToolPreambleBudget(tools, 'auto', ENV_ARG, huge)),
+    fingerprint(ladderUnbounded(tools, huge)));
+  // A DIAMOND: 78 KB full, ~439 KB compact. Under `huge` the FULL tier is accepted;
+  // under the defaults the compact tier is rejected and it drops to skinny. Both must
+  // match the unbounded ladder.
+  const diamond = SHAPES.nested_diamond12();
+  const tight = applyToolPreambleBudget(diamond, 'auto', ENV_ARG, ladderOpts());
+  assert.equal(tight.tier, 'skinny');
+  assert.equal(fingerprint(applyToolPreambleBudget(diamond, 'auto', ENV_ARG, huge)), fingerprint(ladderUnbounded(diamond, huge)));
+  // soft == hard is min()'s tightest case: rejected at exactly the cap.
+  const equal = ladderOpts({ softBytes: 40_000, hardBytes: 40_000 });
+  assert.equal(fingerprint(applyToolPreambleBudget(diamond, 'auto', ENV_ARG, equal)),
+    fingerprint(ladderUnbounded(diamond, equal)));
+  // Every cap split the fixtures exercise — including soft > hard, where the bound has
+  // to be the SMALLER cap or a rejected tier would be built in full — agrees.
+  for (const caps of [{ softBytes: 1, hardBytes: 100_000 }, { softBytes: 10_000, hardBytes: 48_000 }, { softBytes: 48_000, hardBytes: 10_000 }]) {
+    for (const shape of ['tools25', 'nested_diamond12']) {
+      const o = ladderOpts(caps);
+      assert.equal(fingerprint(applyToolPreambleBudget(SHAPES[shape](), 'auto', ENV_ARG, o)),
+        fingerprint(ladderUnbounded(SHAPES[shape](), o)),
+        `${shape} caps ${JSON.stringify(caps)} disagreed with the unbounded ladder`);
+    }
+  }
+});
+
+test('bounded walk: when the tier is dropped, the ladder still reports the tier it would have rejected', () => {
+  // 2000 tools x 1 property: names-only is 31 KB, over the 1500 B hard cap, so the
+  // request must be REJECTED. The compact tier is dropped on the way, and `chosen`
+  // has to end up on names-only (the tier the unbounded ladder reports) rather than
+  // on the dropped one or on whatever was chosen before it.
+  const tools = SHAPES.tools2000x1();
+  const opts = ladderOpts({ softBytes: 1_000, hardBytes: 1_500 });
+  const r = applyToolPreambleBudget(tools, 'auto', ENV_ARG, opts);
+  assert.equal(r.ok, false, 'this shape must still be rejected');
+  assert.equal(r.tier, 'names-only');
+  assert.ok(r.finalBytes > 1_500);
+  assert.equal(fingerprint(r), fingerprint(ladderUnbounded(tools, opts)));
+});
+
+test('bounded walk: the diagnostic still fires for the shape that used to burn the node budget', () => {
+  const capture = () => {
+    const warns = [];
+    const original = log.warn;
+    log.warn = (...args) => { warns.push(args.join(' ')); };
+    try { return { warns, r: applyToolPreambleBudget(SHAPES.nested_diamond14(), 'auto', ENV_ARG, ladderOpts()) }; }
+    finally { log.warn = original; }
+  };
+  // The ladder asks the builder to stop at its cap, so this is the cap-stop arm of
+  // the warning: one line, naming the offending tool and the node budget constant.
+  const { warns } = capture();
+  assert.equal(warns.length, 1, `expected exactly one warning, got ${warns.length}: ${warns.join(' | ')}`);
+  assert.match(warns[0], /TOOL_PREAMBLE: \$ref inlining hit the 50000-node budget/);
+  assert.match(warns[0], /first exhausted at tool "diamond"/);
+  assert.equal(/Innocent/.test(warns[0]), false);
+  // Called with NO byte bound (a direct caller), the same shape still exhausts the
+  // NODE budget instead — that arm must keep its original text, unchanged.
+  const warns2 = [];
+  const original = log.warn;
+  log.warn = (...args) => { warns2.push(args.join(' ')); };
+  try {
+    buildSchemaCompactToolPreambleForProto(SHAPES.nested_diamond14(), 'auto', '', 'claude-sonnet-4.6', null, 'chat', {});
+  } finally { log.warn = original; }
+  assert.deepEqual(warns2, [
+    'TOOL_PREAMBLE: $ref inlining hit the 50000-node budget (first exhausted at tool "diamond", 1 tool(s));'
+    + ' the remaining subtrees were emitted as {"type":"object"} placeholders.'
+    + ' A $ref repeated in sibling positions fans out multiplicatively — look for a'
+    + ' diamond in that schema rather than for a cycle.',
+  ], 'the node-budget warning text changed for direct callers');
+});
+
 // ─── the optimization must still be present (revert/erode detection) ───────
+test('bounded walk: the cost bound is still wired from the caller\'s caps', () => {
+  // The byte bound is deliberately UNOBSERVABLE in the response, so the behavioural
+  // tests above cannot notice it being unhooked — they assert the two paths agree,
+  // which they do even if the builder never receives a cap. Measured: with the bound
+  // removed the whole file still passes. These are the assertions that keep the
+  // optimization itself on the hook, one per way it can be silently disabled.
+  const chat = readFileSync(new URL('../src/handlers/chat.js', import.meta.url), 'utf8');
+  const emu = readFileSync(new URL('../src/handlers/tool-emulation.js', import.meta.url), 'utf8');
+
+  // The bound is DERIVED from the two caps in this function, not a constant: minimum,
+  // because rejection is certain past EITHER cap and the builder prunes what it
+  // returns. `max`, `24000` or any hardcoded literal would move goldens at
+  // soft/hard = 1/100000 and 10000/48000.
+  assert.ok(/const abortAtBytes = Math\.min\(softBytes, hardBytes\);/.test(chat),
+    'the abort bound must be min(softBytes, hardBytes), derived in applyToolPreambleBudget');
+  assert.equal(/const abortAtBytes = (?!Math\.min\(softBytes, hardBytes\))/.test(chat), false,
+    'exactly one abortAtBytes definition, and it must read both caps');
+  // ...and it must actually reach the builder, through the per-tier opts.
+  assert.ok(/\{ \.\.\.tierOpts, \.\.\.t\.opts \}/.test(chat),
+    'the per-tier opts must be spread into the builder call, or the cap never arrives');
+  assert.ok(/opts: \{ abortAtBytes \}/.test(chat),
+    'the schema-compact tier must be the one carrying the abort bound');
+
+  // The builder installs it on the budget and compares with `>`, strictly: `>=` would
+  // stop a walk at exactly the cap, where the finished tier still fits.
+  assert.ok(/if \(budget\.byteLimit === undefined\) budget\.byteLimit = opts\.abortAtBytes;/.test(emu),
+    'the builder must install the caller\'s cap on the budget');
+  assert.ok(/budget\.byteLimit !== undefined && budget\.bytes > budget\.byteLimit/.test(emu),
+    'the cap check must be `>`, and only when a cap was supplied');
+  // The counter that makes the check mean anything, and the floor it is charged at.
+  assert.ok(/budget\.bytes \+= SCHEMA_INLINE_MIN_NODE_BYTES;/.test(emu),
+    'the per-node floor must still be charged, or the byte bound can never bind');
+  assert.ok(/budget\.bytes \+= k\.length \+ 5;/.test(emu),
+    'the per-key floor must still be charged');
+  assert.ok(/const SCHEMA_INLINE_MIN_NODE_BYTES = 2;/.test(emu),
+    'the per-node floor is 2 B (the `{}`), which is what makes the counter a LOWER bound; '
+    + 'raising it over-counts and can drop a tier that still fits');
+  // The stop must be reported to the caller instead of being returned as content.
+  assert.ok(/if \(budget\.stoppedByCap && opts\.abortAtBytes !== undefined\) throw new SchemaCompactTierDropped\(\);/.test(emu),
+    'a cap-stopped build must throw the drop signal, never return its prefix');
+  assert.ok(/isTierOverBudgetSignal\(err\)/.test(chat),
+    'the ladder must drop the tier the builder reported as over budget');
+  // And the diagnostic must still explain WHICH limit stopped it (the ternary alone is
+  // not enough: an empty arm keeps the shape and loses the explanation).
+  assert.ok(/budget\.stoppedByCap\s*\n\s*\?/.test(emu),
+    'the warning must keep its cap-stop arm, or an operator cannot tell the two apart');
+  assert.ok(/already proven more than the preamble byte cap/.test(emu),
+    'the cap-stop arm must still say WHY it stopped');
+  assert.ok(/the rest of that tier is pruned before it is built/.test(emu),
+    'the cap-stop arm must still say what happened to the rest of the tier');
+});
+
 test('schema-compact inliner: the per-node cost reductions are still in place', () => {
   const SRC = readFileSync(new URL('../src/handlers/tool-emulation.js', import.meta.url), 'utf8');
   // assert.ok() rather than assert.match(): a failure here must print the missing

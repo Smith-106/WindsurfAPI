@@ -1,0 +1,81 @@
+{
+  "_baseline_provenance": "MEASURED 2026-09-13 on the author's Windows box, Node v24.19.0, worktree .claude/worktrees/p3c-skip at master 3c42ab0. Declared value 11. Exact command: `node --test test/tool-preamble-strip-equivalence.test.js` -> `tests 11 / pass 11 / fail 0 / cancelled 0 / skipped 0 / todo 0`, IDENTICAL over six consecutive runs. This spec names ONE test file, so the harness's combined invocation and a per-file invocation are the same argv by construction and there is no per-file-vs-combined gap to report. The harness's OWN counting route (scripts/mutation-harness-utils.mjs) was NOT re-measured locally: it throws at import on Windows ('mutation harness requires git at a trusted absolute path'), so the Linux CI dispatch is the authority for the harness-side number. WHY THIS FILE: it is the file whose observable surface this change edits, and it is the only place the bounded-walk property (drop signal, cap provenance, byte-identity against an unbounded ladder) is pinned. The four mutations that live in src/handlers/chat.js and the eight in src/handlers/tool-emulation.js are each one way the optimization can be silently disabled; because the byte bound is deliberately UNOBSERVABLE in the response, most are killed by the structural test ('the cost bound is still wired from the caller's caps') rather than by a behavioural one. All 12 were verified CAUGHT=12 SURVIVED=0 locally before this spec was added (tmp/perf/p3c-teeth.mjs, same argv, Windows). IF THE BASELINE MOVES: a count change here almost certainly means someone added or removed a test in THIS file, not drift, because the suite has no timers, no child processes and no post-import env reads. Re-measure with `node scripts/spec-baseline-audit.mjs preamble-skip-discarded-tier` and change the number in its own commit; do NOT narrow a mutation to make the spec start.",
+  "tests": [
+    "test/tool-preamble-strip-equivalence.test.js"
+  ],
+  "expectBaselinePass": 11,
+  "mutations": [
+    {
+      "name": "the byte bound is never installed — the whole point of the change, and nothing stops at the cap again",
+      "file": "src/handlers/chat.js",
+      "anchor": "      text = t.build(tools || [], toolChoice, callerEnv, modelKey, provider, route, { ...tierOpts, ...t.opts });",
+      "replacement": "      text = t.build(tools || [], toolChoice, callerEnv, modelKey, provider, route, { ...tierOpts });"
+    },
+    {
+      "name": "the walk stops early but the caller is handed the truncated PREFIX — the ladder then ships it as a tier it must reject",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "  if (budget.stoppedByCap && opts.abortAtBytes !== undefined) throw new SchemaCompactTierDropped();\n",
+      "replacement": ""
+    },
+    {
+      "name": "the drop signal is renamed, so the ladder's name check misses it and the prefix escapes as a thrown error",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "  constructor() { super(\"schema-compact tier is over the caller's byte cap\"); this.name = 'SchemaCompactTierDropped'; }",
+      "replacement": "  constructor() { super(\"schema-compact tier is over the caller's byte cap\"); this.name = 'NotTheNameYouCheck'; }"
+    },
+    {
+      "name": "the ladder stops listening for the drop signal — a dropped tier is measured as if it were a real one",
+      "file": "src/handlers/chat.js",
+      "anchor": "const isTierOverBudgetSignal = (err) => err?.name === 'SchemaCompactTierDropped';",
+      "replacement": "const isTierOverBudgetSignal = (err) => err?.name === 'NotTheNameYouCheck';"
+    },
+    {
+      "name": "the drop bound is derived from a hardcoded 24000 instead of the caller's caps",
+      "file": "src/handlers/chat.js",
+      "anchor": "  const abortAtBytes = Math.min(softBytes, hardBytes);",
+      "replacement": "  const abortAtBytes = 24000;"
+    },
+    {
+      "name": "the drop bound uses the LARGER cap, so a tier rejected at either cap is built in full again",
+      "file": "src/handlers/chat.js",
+      "anchor": "  const abortAtBytes = Math.min(softBytes, hardBytes);",
+      "replacement": "  const abortAtBytes = Math.max(softBytes, hardBytes);"
+    },
+    {
+      "name": "the counter never advances — the byte bound is present but can never bind",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "  budget.bytes += SCHEMA_INLINE_MIN_NODE_BYTES;\n",
+      "replacement": ""
+    },
+    {
+      "name": "the per-node floor is raised until it OVER-counts, which would stop a walk whose finished tier still fit the cap",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "const SCHEMA_INLINE_MIN_NODE_BYTES = 2;",
+      "replacement": "const SCHEMA_INLINE_MIN_NODE_BYTES = 17;"
+    },
+    {
+      "name": "the bound is checked against the wrong side of the cap (>= stops at exactly the cap)",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "    if (budget.byteLimit !== undefined && budget.bytes > budget.byteLimit) throw new SchemaInlineOverBudget();",
+      "replacement": "    if (budget.byteLimit !== undefined && budget.bytes >= budget.byteLimit) throw new SchemaInlineOverBudget();"
+    },
+    {
+      "name": "the byte cap is ignored when undefined, so an unbounded direct caller now aborts",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "      if (budget.byteLimit === undefined) budget.byteLimit = opts.abortAtBytes;",
+      "replacement": "      budget.byteLimit = opts.abortAtBytes || 1;"
+    },
+    {
+      "name": "the cap-stop warning arm is dropped — the stall goes back to being visible only to the node budget",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "      + (budget.stoppedByCap\n",
+      "replacement": "      + (false\n"
+    },
+    {
+      "name": "the diagnostic stops saying WHY it stopped — an operator cannot tell a byte-cap stop from node exhaustion",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "        ? ' (Stopped early: the inlining had already proven more than the preamble byte cap,'\n          + ' so the rest of that tier is pruned before it is built.)'",
+      "replacement": "        ? ''"
+    }
+  ]
+}

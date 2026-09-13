@@ -652,6 +652,27 @@ function resolveLocalSchemaRef(ref, root) {
 // same event-loop stall wearing a different hat.
 const SCHEMA_INLINE_NODE_BUDGET = 50000;
 
+// Smallest serialized cost of one inlined object node, and the reason the byte bound
+// below can be checked with a counter instead of a string.
+//
+// Each term of a node's cost is one the walk itself enforces, so the counter in
+// `budget.bytes` is a LOWER bound on the built string's length and can be compared
+// against a cap without ever over-counting:
+//
+//   * an inlined node is always an object, so it emits at least `{}` = 2 B — that is
+//     this constant;
+//   * every kept key emits `"` + key + `"` + `:` + `,` = key.length + 5 B, charged in
+//     the loop below;
+//   * a kept scalar value is copied verbatim, so a string value costs its UTF-16
+//     length, which JSON escaping can only make LONGER (never shorter).
+//
+// Measured against `JSON.stringify` over a 55-node shape battery in
+// tmp/perf/p3c-bound-proof.mjs: ratio counter/true <= 0.8824 everywhere, 0 violations.
+// Raising the constant above 2 would break that property — `{"type":"a"}` serializes
+// to 12 B, not 17 B — and over-counting could stop a walk whose finished tier would
+// have fit under the cap.
+const SCHEMA_INLINE_MIN_NODE_BYTES = 2;
+
 // Schema keys the compact preamble keeps. Hoisted: this was rebuilt — one Set of
 // 11 strings — on EVERY object node the stripper visits, and a $ref that fans out
 // makes that tens of thousands of nodes (see the budget above). It is a constant,
@@ -659,7 +680,21 @@ const SCHEMA_INLINE_NODE_BUDGET = 50000;
 const SCHEMA_KEEP_KEYS = new Set(['type', 'enum', 'properties', 'items', 'required', 'oneOf', 'anyOf', 'allOf', 'const', 'format', 'additionalProperties']);
 
 function newSchemaInlineBudget() {
-  return { remaining: SCHEMA_INLINE_NODE_BUDGET, exhausted: false, refs: new Map() };
+  return { remaining: SCHEMA_INLINE_NODE_BUDGET, exhausted: false, refs: new Map(), bytes: 0 };
+}
+
+// Thrown when the walk has PROVABLY produced more bytes than the caller can accept.
+// Caught by the one caller (buildSchemaCompactToolPreambleForProto); it never escapes
+// into a response.
+class SchemaInlineOverBudget extends Error {}
+
+// Raised by buildSchemaCompactToolPreambleForProto when the caller asked it to stop at
+// its own byte cap AND the walk hit that cap: the tier is provably over the cap, so the
+// ladder must DROP it rather than receive the prefix (see the builder for why the prefix
+// must never be returned). Identified by NAME, not by `instanceof`, so the caller does
+// not have to import a symbol that exists only on this side of the change.
+export class SchemaCompactTierDropped extends Error {
+  constructor() { super("schema-compact tier is over the caller's byte cap"); this.name = 'SchemaCompactTierDropped'; }
 }
 
 // resolveLocalSchemaRef is pure in (ref, root), but a diamond repeats the same
@@ -691,6 +726,13 @@ function stripSchemaDocs(schema, root = schema, refStack = [], budget = newSchem
   budget.remaining--;
   if (typeof schema.$ref === 'string') {
     const ref = schema.$ref;
+    // Each term charged here is one this walk itself enforces, so `budget.bytes` is a
+    // LOWER bound on the built string's length (audited byte for byte in
+    // tmp/perf/p3c-bound-proof.mjs, worst ratio 0.8824). `budget.byteLimit` is the byte
+    // cap the tier ladder passed in; the first charge that takes the sum over it proves
+    // the finished string would be over the cap too, so the caller can drop the tier
+    // without the string ever being built.
+    budget.bytes += SCHEMA_INLINE_MIN_NODE_BYTES;
     // On cycles, replace the recursive edge with a generic object placeholder.
     // Leaving `{$ref: ...}` in the output would dangle because we strip $defs
     // below, and the model would have nothing to resolve the pointer against.
@@ -707,6 +749,12 @@ function stripSchemaDocs(schema, root = schema, refStack = [], budget = newSchem
   for (const k of Object.keys(schema)) {
     const v = schema[k];
     if (!SCHEMA_KEEP_KEYS.has(k)) continue;
+    // The key IS emitted (quotes + colon + the comma before it), so it is charged here;
+    // an object or array value is charged by its own walk, so only scalar values are
+    // charged for their length. Both terms are floors on what the serializer must
+    // write, which is what lets the sum be compared against a cap.
+    budget.bytes += k.length + 5;
+    if (budget.byteLimit !== undefined && budget.bytes > budget.byteLimit) throw new SchemaInlineOverBudget();
     if (k === 'properties' && v && typeof v === 'object') {
       const props = {};
       for (const pk of Object.keys(v)) { const pv = v[pk]; props[pk] = stripSchemaDocs(pv, root, refStack, budget); }
@@ -718,6 +766,7 @@ function stripSchemaDocs(schema, root = schema, refStack = [], budget = newSchem
       else if (v && typeof v === 'object') out[k] = stripSchemaDocs(v, root, refStack, budget);
     } else {
       out[k] = v;
+      if (typeof v === 'string') budget.bytes += v.length;
     }
   }
   return out;
@@ -778,7 +827,10 @@ export function buildSchemaCompactToolPreambleForProto(tools, toolChoice, enviro
   }
   lines.push('');
   lines.push('Available functions:');
-  // One budget for the whole build: see SCHEMA_INLINE_NODE_BUDGET.
+  // One budget for the whole build: see SCHEMA_INLINE_NODE_BUDGET. `opts.abortAtBytes`
+  // is the byte cap applyToolPreambleBudget passes down; the loop below installs it on
+  // the first tool with parameters. Without it the build is bounded only by the node
+  // budget, which is what every direct caller of this function gets.
   const budget = newSchemaInlineBudget();
   let firstTruncated = null;
   for (const t of tools) {
@@ -789,21 +841,52 @@ export function buildSchemaCompactToolPreambleForProto(tools, toolChoice, enviro
     if (description) lines.push(firstSentence(description));
     if (parameters) {
       const wasExhausted = budget.exhausted;
-      const stripped = stripSchemaDocs(parameters, parameters, [], budget);
+      // First tool with parameters installs the caller's byte cap (idempotent, so every
+      // later tool keeps it). `undefined` disables the byte bound entirely.
+      if (budget.byteLimit === undefined) budget.byteLimit = opts.abortAtBytes;
+      let stripped;
+      try {
+        stripped = stripSchemaDocs(parameters, parameters, [], budget);
+      } catch (err) {
+        if (!(err instanceof SchemaInlineOverBudget)) throw err;
+        // The walk proved the FINISHED string would be over the caller's cap: the
+        // counter is a lower bound on it. That does NOT mean the prefix built so far is
+        // over the cap — it is not, it is SHORTER than the canonical tier, precisely
+        // because the subtree that blew the budget was abandoned. The prefix is
+        // therefore never returned to a bounded caller (see the throw at the end of this
+        // function); it exists only to keep the diagnostic below firing for the shapes
+        // that used to burn the node budget. The stall used to be invisible, and
+        // silencing it again would cost more than the milliseconds it saves.
+        budget.exhausted = true;
+        budget.stoppedByCap = true;
+        stripped = { type: 'object' };
+      }
       if (!wasExhausted && budget.exhausted) firstTruncated = name;
       lines.push(`Params: ${JSON.stringify(stripped)}`);
     }
   }
   // Without this the stall is invisible: the caller burns the event loop, the
   // oversized tier is thrown away by applyToolPreambleBudget, and the request
-  // succeeds on a lower tier reporting nothing unusual.
+  // succeeds on a lower tier reporting nothing unusual. Both exits land here: the
+  // node budget (direct callers) and the caller-supplied byte cap (the tier ladder).
   if (budget.exhausted) {
     log.warn(`TOOL_PREAMBLE: $ref inlining hit the ${SCHEMA_INLINE_NODE_BUDGET}-node budget`
       + ` (first exhausted at tool "${firstTruncated}", ${tools.length} tool(s));`
       + ' the remaining subtrees were emitted as {"type":"object"} placeholders.'
       + ' A $ref repeated in sibling positions fans out multiplicatively — look for a'
-      + ' diamond in that schema rather than for a cycle.');
+      + ' diamond in that schema rather than for a cycle.'
+      + (budget.stoppedByCap
+        ? ' (Stopped early: the inlining had already proven more than the preamble byte cap,'
+          + ' so the rest of that tier is pruned before it is built.)'
+        : ''));
   }
+  // The prefix built above is NOT a preamble: it is short precisely because the rest of
+  // it was pruned, so a ladder that measured it could ACCEPT a tier it must reject
+  // (measured: the 14-level diamond dropped from 1,003,933 B to 2,687 B and was shipped
+  // as `schema-compact` instead of `skinny`). A bounded caller therefore gets the drop
+  // signal instead of the prefix; an unbounded direct caller keeps the truncated string,
+  // which is what it already got from the node budget.
+  if (budget.stoppedByCap && opts.abortAtBytes !== undefined) throw new SchemaCompactTierDropped();
   return lines.join('\n');
 }
 
